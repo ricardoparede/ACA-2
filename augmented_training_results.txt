@@ -1,0 +1,34 @@
+Results from notebooks/07_augmented_training.ipynb
+
+--- Configuration and Setup ---
+Using device: cuda
+Number of classes: 75
+Original — Train: 3,606  Val: 745  Test: 848
+Test samples: 848
+Baseline — Train: 3,606  Val: 745
+
+--- Run 1: Baseline (Original Data Only) ---
+[checkpoint] loaded ← c:\Users\ricar\Downloads\TP2-Students\saved_models\baseline.pth
+Baseline  |  Accuracy: 0.3314  Macro F1: 0.3050
+
+--- Run 2: Baseline + cVAE-Generated Data ---
+cVAE generated samples: 1,869
+Combined (original + cVAE): 5,475
+Augmented train batches: 172
+[+cVAE] Epoch:   1  Train Loss: 4.1651  Val Loss: 4.4177  Val Acc: 0.0282
+[+cVAE] Epoch:  10  Train Loss: 3.1872  Val Loss: 3.7061  Val Acc: 0.1208
+[+cVAE] Epoch:  24  Train Loss: 2.7265  Val Loss: 3.4858  Val Acc: 0.1799
+[+cVAE] Epoch:  38  Train Loss: 2.2223  Val Loss: 3.4043  Val Acc: 0.2309
+[+cVAE] Epoch:  50  Train Loss: 1.8262  Val Loss: 3.7252  Val Acc: 0.1584
+[checkpoint] loaded ← c:\Users\ricar\Downloads\TP2-Students\saved_models\baseline_cvae.pth
++cVAE     |  Accuracy: 0.2300  Macro F1: 0.1860
+
+--- Run 3: Baseline + GAN-Generated Data ---
+ERROR: FileNotFoundError: [Errno 2] No such file or directory: 'c:\\Users\\ricar\\Downloads\\TP2-Students\\data\\generated\\gan\\generated.csv'
+(Note: Runs 3, 4, 5, 6 appear to have been blocked or not executed in the saved notebook state due to missing CSV files or runtime errors).
+
+--- Summary Analysis ---
+The notebook shows that the Baseline model achieved a Top-1 Accuracy of 33.14% and a Macro F1 of 30.50% on the test set. 
+Augmenting with cVAE data (adding 1,869 samples) actually decreased performance to 23.00% accuracy and 18.60% Macro F1. 
+This negative result is consistent with the very low Oracle retention rate for cVAE (0.4%), suggesting the generated images were likely poor quality and acted as noise during training.
+Further runs (GAN, WGAN-GP, BigGAN, Diffusion) were not successfully completed in the version of the notebook inspected, likely due to the lack of generated data at the time of execution.

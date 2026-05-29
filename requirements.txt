@@ -1,0 +1,25 @@
+# ── Deep Learning ──────────────────────────────────────────────────────────
+# Install PyTorch with CUDA 12.8 (RTX 50-series / Blackwell):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+torch>=2.7.0
+torchvision>=0.22.0
+
+# ── Data / Numerics ────────────────────────────────────────────────────────
+numpy>=1.26.0
+pandas>=2.2.0
+scipy>=1.13.0
+
+# ── Image I/O ──────────────────────────────────────────────────────────────
+Pillow>=10.3.0
+scikit-image>=0.23.0
+scikit-learn>=1.4.0
+
+# ── Visualisation ──────────────────────────────────────────────────────────
+matplotlib>=3.8.0
+
+# ── Progress bars ──────────────────────────────────────────────────────────
+tqdm>=4.66.0
+
+# ── Jupyter ────────────────────────────────────────────────────────────────
+jupyter>=1.1.0
+ipykernel>=6.29.0
