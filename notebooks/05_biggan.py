@@ -17,11 +17,12 @@
 # # Conditional BigGAN (Simplified for 64x64)
 # ### Butterfly Dataset — 75-class conditional image generation
 #
-# Upgrades the generative pipeline by implementing BigGAN features:
-# - Residual Blocks in both Generator and Discriminator for massive capacity.
-# - Spectral Normalization applied to all Convolutional and Linear layers.
-# - Projection Discriminator for elegant class conditioning.
-# - Hinge Loss (Standard for BigGAN architectures).
+# Implementation details:
+# - Residual Block architecture in G and D
+# - Spectral Normalization on all convolutional and linear layers
+# - Projection Discriminator for class conditioning
+# - Hinge Loss objective for training stability
+#
 
 # %%
 import os, sys
@@ -36,7 +37,7 @@ import matplotlib.pyplot as plt
 from collections import Counter
 import pandas as pd
 
-# ── Device setup ─────────────────────────────────────────────────────────
+# ── Device Configuration ──────────────────────────────────────────────────
 device = torch.device(
     "cuda"  if torch.cuda.is_available()  else
     "mps"   if torch.backends.mps.is_available() else
@@ -45,6 +46,7 @@ device = torch.device(
 print(f"Using device: {device}")
 
 # %%
+# ── Project Path Setup ────────────────────────────────────────────────────
 sys.path.insert(0, os.path.abspath(".."))
 
 from src.dataset import (
@@ -58,7 +60,7 @@ from src.utils import (
 from src.metrics import compute_fid, compute_inception_score
 
 # %%
-# ── Configuration ──────────────────────────────────────────────────────────
+# ── Hyperparameters and Paths ──────────────────────────────────────────────
 BASE_DIR    = os.path.abspath("..")
 IMG_DIR     = os.path.join(BASE_DIR, "aca-butterflies", "train")
 CSV_PATH    = os.path.join(BASE_DIR, "aca-butterflies", "train.csv")
@@ -77,20 +79,21 @@ NUM_EPOCHS  = 200
 SAVE_EVERY  = 20
 
 # %%
+# ── Dataset Initialization ────────────────────────────────────────────────
 label_to_idx, idx_to_label = build_label_map(CSV_PATH)
 num_classes = len(label_to_idx)
 
 train_df, val_df, test_df = get_splits(CSV_PATH, train_ratio=0.70, val_ratio=0.15, seed=42)
 train_set    = ButterflyDataset(train_df, IMG_DIR, label_to_idx, transform=get_train_transform(IMAGE_SIZE))
 train_loader = make_dataloader(train_set, BATCH_SIZE, shuffle=True)
-print(f"Batches: {len(train_loader)}")
+
 
 # %% [markdown]
-# ## Model Architecture: BigGAN Residual Blocks
+# ## Model Architecture: Residual GAN Blocks
 
 # %%
 class GBlock(nn.Module):
-    """Generator Residual Block with Upsampling"""
+    """Generator Residual Block: Upsampling + Spectral Norm Conv."""
     def __init__(self, in_ch, out_ch):
         super().__init__()
         self.conv1 = spectral_norm(nn.Conv2d(in_ch, out_ch, 3, 1, 1))
@@ -98,7 +101,6 @@ class GBlock(nn.Module):
         self.bn1   = nn.BatchNorm2d(in_ch)
         self.bn2   = nn.BatchNorm2d(out_ch)
         self.up    = nn.Upsample(scale_factor=2)
-        # Skip connection needs to adjust channels and resolution
         self.skip  = spectral_norm(nn.Conv2d(in_ch, out_ch, 1, 1, 0))
 
     def forward(self, x):
@@ -113,7 +115,7 @@ class GBlock(nn.Module):
         return h + s
 
 class DBlock(nn.Module):
-    """Discriminator Residual Block with Downsampling"""
+    """Discriminator Residual Block: Downsampling + Spectral Norm Conv."""
     def __init__(self, in_ch, out_ch, downsample=True):
         super().__init__()
         self.downsample = downsample
@@ -139,6 +141,7 @@ class DBlock(nn.Module):
 
 # %%
 class Generator(nn.Module):
+    """BigGAN-style Generator: Maps latent vector + class embedding to RGB."""
     def __init__(self, latent_dim=LATENT_DIM, num_classes=NUM_CLASSES, emb_dim=EMB_DIM):
         super().__init__()
         self.class_emb = spectral_norm(nn.Embedding(num_classes, emb_dim))
@@ -147,10 +150,10 @@ class Generator(nn.Module):
         self.init_linear = spectral_norm(nn.Linear(in_ch, 4 * 4 * 512))
         
         self.blocks = nn.Sequential(
-            GBlock(512, 256), # 4x4 -> 8x8
-            GBlock(256, 128), # 8x8 -> 16x16
-            GBlock(128, 64),  # 16x16 -> 32x32
-            GBlock(64, 32),   # 32x32 -> 64x64
+            GBlock(512, 256),
+            GBlock(256, 128),
+            GBlock(128, 64),
+            GBlock(64, 32),
         )
         self.out_bn = nn.BatchNorm2d(32)
         self.out_conv = spectral_norm(nn.Conv2d(32, 3, 3, 1, 1))
@@ -167,39 +170,35 @@ class Generator(nn.Module):
         return torch.tanh(h)
 
 class Discriminator(nn.Module):
+    """Projection Discriminator: Computes hinge loss score and class projection dot-product."""
     def __init__(self, num_classes=NUM_CLASSES):
         super().__init__()
         self.blocks = nn.Sequential(
-            DBlock(3, 64, downsample=True),    # 64x64 -> 32x32
-            DBlock(64, 128, downsample=True),  # 32x32 -> 16x16
-            DBlock(128, 256, downsample=True), # 16x16 -> 8x8
-            DBlock(256, 512, downsample=True), # 8x8 -> 4x4
-            DBlock(512, 512, downsample=False) # 4x4 -> 4x4
+            DBlock(3, 64, downsample=True),
+            DBlock(64, 128, downsample=True),
+            DBlock(128, 256, downsample=True),
+            DBlock(256, 512, downsample=True),
+            DBlock(512, 512, downsample=False)
         )
         self.out_linear = spectral_norm(nn.Linear(512, 1))
-        # Projection Discriminator Embedding
         self.class_emb = spectral_norm(nn.Embedding(num_classes, 512))
 
     def forward(self, img, label):
         h = self.blocks(img)
         h = F.relu(h)
-        h = torch.sum(h, dim=[2, 3]) # Global Average Pooling
+        h = torch.sum(h, dim=[2, 3])
         
         out = self.out_linear(h)
         
-        # Projection Conditioning: Add the dot product of features and class embedding
         c = self.class_emb(label)
         out += torch.sum(c * h, dim=1, keepdim=True)
         return out.view(-1)
 
 # %%
+# ── Model Initialization and Optimizers ──────────────────────────────────
 netG = Generator().to(device)
 netD = Discriminator().to(device)
 
-print(f"Generator parameters    : {sum(p.numel() for p in netG.parameters()):,}")
-print(f"Discriminator parameters: {sum(p.numel() for p in netD.parameters()):,}")
-
-# BigGAN uses TTUR natively with specific Betas
 LR_D = 0.0004
 LR_G = 0.0001
 BETAS = (0.0, 0.999)
@@ -219,19 +218,15 @@ for epoch in range(NUM_EPOCHS):
         lbls = labels.to(device)
         batch_size = real_imgs.size(0)
 
-        # ─── 1. Update Discriminator ─────────────────────────────────────
+        # ─── Update D (Critic) ───────────────────────────────────────────
         netD.zero_grad()
         
-        # Real Pass
         d_real = netD(real_imgs, lbls)
-        # Hinge Loss for Real
         loss_d_real = F.relu(1.0 - d_real).mean() 
         
-        # Fake Pass
         noise = torch.randn(batch_size, LATENT_DIM, device=device)
         fake_imgs = netG(noise, lbls)
         d_fake = netD(fake_imgs.detach(), lbls)
-        # Hinge Loss for Fake
         loss_d_fake = F.relu(1.0 + d_fake).mean() 
         
         errD = loss_d_real + loss_d_fake
@@ -240,10 +235,9 @@ for epoch in range(NUM_EPOCHS):
         
         epoch_D += errD.item()
 
-        # ─── 2. Update Generator ─────────────────────────────────────────
+        # ─── Update G ────────────────────────────────────────────────────
         netG.zero_grad()
         
-        # Generator wants Discriminator to think fake is real
         d_fake_g = netD(fake_imgs, lbls)
         errG = -d_fake_g.mean()
         
@@ -259,7 +253,7 @@ for epoch in range(NUM_EPOCHS):
     G_losses.append(epoch_G / len(train_loader))
     D_losses.append(epoch_D / len(train_loader))
 
-    # ── Save generated samples every SAVE_EVERY epochs ───────────────────
+    # ── Checkpointing and Periodic Visualization ─────────────────────────
     if (epoch + 1) % SAVE_EVERY == 0 or epoch == NUM_EPOCHS - 1:
         netG.eval()
         with torch.no_grad():
@@ -281,7 +275,7 @@ for epoch in range(NUM_EPOCHS):
 print("BigGAN Training complete.")
 
 # %%
-# ── Plot Loss Curves ──────────────────────────────────────────────────────
+# ── Evaluation: Loss Curves ──────────────────────────────────────────────
 plt.figure(figsize=(10, 5))
 plt.plot(G_losses, label="Generator")
 plt.plot(D_losses, label="Discriminator (Critic)")
@@ -292,8 +286,9 @@ plt.legend()
 plt.grid(True, alpha=0.3)
 plt.show()
 
+
 # %%
-# ── Generate Data and Evaluate ────────────────────────────────────────────
+# ── Sample Generation and Dataset Balancing ───────────────────────────────
 load_checkpoint(NETG_PATH, netG, device)
 netG = netG.to(device)
 netG.eval()

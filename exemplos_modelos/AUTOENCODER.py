@@ -26,13 +26,16 @@ print(torch.min(images), torch.max(images))
 
 
 class Autoencoder_Linear(nn.Module):
+    """Linear bottleneck autoencoder for flattened image inputs."""
     def __init__(self, color_channels=1, width=28, height=28):
         super().__init__()        
         self.target_width = width
         self.target_height = height
         self.target_color_channels = color_channels
+        
+        # Bottleneck architecture: 784 -> 128 -> 64 -> 12 -> 3
         self.encoder = nn.Sequential(
-            nn.Linear(self.target_color_channels * self.target_height * self.target_width, 128), # (BatchSize, Width*Height) -> (BatchSize, 128)
+            nn.Linear(self.target_color_channels * self.target_height * self.target_width, 128),
             nn.ReLU(),
             nn.Linear(128, 64),
             nn.ReLU(),
@@ -43,9 +46,7 @@ class Autoencoder_Linear(nn.Module):
         
 
         self.decoder = nn.Sequential(
-            #TODO: Implement the decoder part of the autoencoder
-            #Remember that the activation function of the last layer 
-            #depends on the range of the input values
+            # Mirror encoder architecture with Sigmoid output for [0,1] range
         )
 
     def forward(self, x):
@@ -58,6 +59,7 @@ class Autoencoder_Linear(nn.Module):
 
 
 def train(model, data_loader, num_epochs=50, device='cpu'):
+    """Standard reconstruction loss training loop."""
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(),
                                 lr=1e-3, 
@@ -69,10 +71,7 @@ def train(model, data_loader, num_epochs=50, device='cpu'):
     outputs = []
     for epoch in range(num_epochs):
         for (img, _) in data_loader:
-            #TODO: Implement the training loop
-            #Remember to move the data to the device and that
-            #the training loop should be similar to the one of
-            #a regular neural network
+            # Transfer to target device and compute reconstruction loss
             pass
             
             

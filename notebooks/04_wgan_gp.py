@@ -17,14 +17,11 @@
 # # Conditional WGAN-GP
 # ### Butterfly Dataset — 75-class conditional image generation
 #
-# Improves over the cGAN baseline (03_gan.ipynb) by replacing BCE loss with
-# the Wasserstein loss + Gradient Penalty (WGAN-GP):
-# - Critic updated `CRITIC_ITERATIONS` times per Generator update
-# - No Sigmoid in Critic; raw logits used directly
-# - WGAN-GP optimiser settings: `lr=1e-4, betas=(0.0, 0.9)`
-# - InstanceNorm (instead of BatchNorm) in Critic for compatibility with GP
-#
-# Class conditioning via `nn.Embedding` in both Generator and Critic.
+# Implementation details:
+# - Wasserstein objective with Gradient Penalty (GP) for Lipschitz constraint
+# - Critic-heavy training (5 iterations per Generator update)
+# - No batch normalization in Critic to avoid inter-sample dependency in GP
+# - TTUR (Two Time-Scale Update Rule) for stable convergence
 #
 
 # %%
@@ -37,7 +34,8 @@ from torchvision.utils import make_grid
 import matplotlib.pyplot as plt
 from collections import Counter
 import pandas as pd
-# ── Device setup ─────────────────────────────────────────────────────────
+
+# ── Device Configuration ──────────────────────────────────────────────────
 device = torch.device(
     "cuda"  if torch.cuda.is_available()  else
     "mps"   if torch.backends.mps.is_available() else
@@ -47,6 +45,7 @@ print(f"Using device: {device}")
 
 
 # %%
+# ── Project Path Setup ────────────────────────────────────────────────────
 sys.path.insert(0, os.path.abspath(".."))
 
 from src.dataset import (
@@ -62,7 +61,7 @@ from src.metrics import compute_fid, compute_inception_score
 
 
 # %%
-# ── Configuration ──────────────────────────────────────────────────────────
+# ── Hyperparameters and Paths ──────────────────────────────────────────────
 BASE_DIR    = os.path.abspath("..")
 IMG_DIR     = os.path.join(BASE_DIR, "aca-butterflies", "train")
 CSV_PATH    = os.path.join(BASE_DIR, "aca-butterflies", "train.csv")
@@ -71,18 +70,18 @@ NETG_PATH   = os.path.join(BASE_DIR, "saved_models", "wgan_gp_generator.pth")
 NETD_PATH   = os.path.join(BASE_DIR, "saved_models", "wgan_gp_critic.pth")
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# Hyperparameters — mirroring GAN.py where applicable
-IMAGE_SIZE  = 64        # matches TP2-students.ipynb
-BATCH_SIZE  = 64        # RTX 5060 Laptop 8.5 GB VRAM
-LATENT_DIM  = 100       # same as GAN.py noise dim
+IMAGE_SIZE  = 64
+BATCH_SIZE  = 64
+LATENT_DIM  = 100
 NUM_CLASSES = 75
-EMB_DIM     = 100       # class embedding fed into G; projected to spatial in D
+EMB_DIM     = 100
 
 NUM_EPOCHS  = 200
-SAVE_EVERY  = 20        # save checkpoint every N epochs
+SAVE_EVERY  = 20
 
 
 # %%
+# ── Dataset Initialization ────────────────────────────────────────────────
 label_to_idx, idx_to_label = build_label_map(CSV_PATH)
 num_classes = len(label_to_idx)
 
@@ -92,10 +91,10 @@ print(f"Train: {len(train_df):,}  Val: {len(val_df):,}  Test: {len(test_df):,}")
 train_set    = ButterflyDataset(train_df, IMG_DIR, label_to_idx,
                                 transform=get_train_transform(IMAGE_SIZE))
 train_loader = make_dataloader(train_set, BATCH_SIZE, shuffle=True)
-print(f"Batches: {len(train_loader)}")
 
 
 # %%
+# ── Batch Visualization ───────────────────────────────────────────────────
 imgs, labs = next(iter(train_loader))
 visualize_grid(imgs, labs, idx_to_label, n=16, nrow=8,
                title="Training samples", denorm=True)
@@ -105,21 +104,16 @@ visualize_grid(imgs, labs, idx_to_label, n=16, nrow=8,
 # ## Model Architecture
 #
 # ### Generator (netG)
-# `noise (100-dim)` + `class embedding (100-dim)` → concat (200-dim) → reshape (200×1×1)
-# → ConvTranspose blocks: 200→256→128→64→32→3 → **Tanh** → `64×64×3` image
+# Residual-based or ConvTranspose upsampler mapping `noise` + `class embedding` to RGB.
 #
 # ### Critic (netD)
-# `image (3×64×64)` + class embedding projected to `(1×64×64)` spatial map
-# → concat on channel dim → Conv blocks: 4→64→128→256→512→1 → raw scalar (no Sigmoid)
-# InstanceNorm used instead of BatchNorm (required for WGAN-GP gradient penalty).
+# Estimates the Wasserstein distance. Uses InstanceNorm or no normalization
+# to maintain Gradient Penalty validity.
 #
 
 # %%
 def weights_init(m):
-    """
-    Custom weight initialisation — standard for DCGAN/WGAN-GP.
-    Conv layers: N(0, 0.02); BatchNorm layers: N(1, 0.02), bias=0.
-    """
+    """Initialize weights using standard DCGAN/WGAN normal distributions."""
     classname = m.__class__.__name__
     if classname.find("Conv") != -1:
         nn.init.normal_(m.weight.data, 0.0, 0.02)
@@ -131,43 +125,40 @@ def weights_init(m):
 
 # %%
 class Generator(nn.Module):
-    """
-    Conditional Generator for WGAN-GP.
-    Input: noise (LATENT_DIM,) + class_idx → output: (3, 64, 64) image in [-1,1].
-    """
+    """Conditional Generator: maps latent vector + class index to image space."""
 
     def __init__(self, latent_dim=LATENT_DIM, num_classes=NUM_CLASSES, emb_dim=EMB_DIM):
         super().__init__()
         self.class_emb = nn.Embedding(num_classes, emb_dim)
-        # Input to first ConvTranspose: latent_dim + emb_dim = 200
         in_ch = latent_dim + emb_dim
         self.main = nn.Sequential(
-            # ConvTranspose backbone: 200-dim input → 64×64 RGB output
-            nn.ConvTranspose2d(in_ch, 256, 4, 1, 0, bias=False),  # → 4×4
+            nn.ConvTranspose2d(in_ch, 256, 4, 1, 0, bias=False),
             nn.BatchNorm2d(256),
             nn.ReLU(True),
-            nn.ConvTranspose2d(256, 128, 4, 2, 1, bias=False),    # → 8×8
+            nn.ConvTranspose2d(256, 128, 4, 2, 1, bias=False),
             nn.BatchNorm2d(128),
             nn.ReLU(True),
-            nn.ConvTranspose2d(128, 64, 4, 2, 1, bias=False),     # → 16×16
+            nn.ConvTranspose2d(128, 64, 4, 2, 1, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(True),
-            nn.ConvTranspose2d(64, 32, 4, 2, 1, bias=False),      # → 32×32
+            nn.ConvTranspose2d(64, 32, 4, 2, 1, bias=False),
             nn.BatchNorm2d(32),
             nn.ReLU(True),
-            nn.ConvTranspose2d(32, 3, 4, 2, 1, bias=False),       # → 64×64
+            nn.ConvTranspose2d(32, 3, 4, 2, 1, bias=False),
             nn.Tanh(),
         )
 
     def forward(self, noise, label):
-        c = self.class_emb(label).unsqueeze(-1).unsqueeze(-1)      # (B, emb, 1, 1)
-        z = torch.cat([noise, c], dim=1)                           # (B, in_ch, 1, 1)
+        c = self.class_emb(label).unsqueeze(-1).unsqueeze(-1)
+        z = torch.cat([noise, c], dim=1)
         return self.main(z)
 
 
 
 # %%
 class Discriminator(nn.Module):
+    """Conditional Critic: estimates Wasserstein score for (image, label) pairs."""
+
     def __init__(self, num_classes=NUM_CLASSES, emb_dim=EMB_DIM, image_size=IMAGE_SIZE):
         super().__init__()
         self.image_size = image_size
@@ -177,7 +168,6 @@ class Discriminator(nn.Module):
             nn.Linear(emb_dim, image_size * image_size),
         )
         
-        # Simplified Critic: No Normalization
         self.model = nn.Sequential(
             nn.Conv2d(4, 64, 4, 2, 1, bias=False),
             nn.LeakyReLU(0.2, inplace=True),
@@ -203,20 +193,13 @@ class Discriminator(nn.Module):
 
 # %%
 def compute_gradient_penalty(netD, real_samples, fake_samples, labels, device):
-    """Calculates the gradient penalty loss for WGAN GP"""
-    # Random weight term for interpolation between real and fake samples
+    """Enforce 1-Lipschitz continuity via L2 norm of gradients on interpolated samples."""
     alpha = torch.rand(real_samples.size(0), 1, 1, 1, device=device)
-    
-    # Get random interpolation between real and fake samples
     interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True)
     
-    # Run Critic on interpolates
     d_interpolates = netD(interpolates, labels)
-    
-    # Fake tensor to match output size for autograd
     fake = torch.ones(real_samples.size(0), device=device)
     
-    # Get gradient w.r.t. interpolates
     gradients = torch.autograd.grad(
         outputs=d_interpolates,
         inputs=interpolates,
@@ -226,29 +209,18 @@ def compute_gradient_penalty(netD, real_samples, fake_samples, labels, device):
         only_inputs=True,
     )[0]
     
-    # Flatten the gradients to (Batch_size, -1)
     gradients = gradients.view(gradients.size(0), -1)
-    
-    # Calculate penalty: ((L2_norm(gradients) - 1)^2).mean()
     gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
     return gradient_penalty
 
 
 # %%
-# %%
-# ── Instantiate ───────────────────────────────────────────────────────────
+# ── Model Initialization and Optimizers ──────────────────────────────────
 netG = Generator(LATENT_DIM, NUM_CLASSES, EMB_DIM).to(device)
 netD = Discriminator(NUM_CLASSES, EMB_DIM, IMAGE_SIZE).to(device)
 netG.apply(weights_init)
 netD.apply(weights_init)
 
-print(f"Generator parameters    : {sum(p.numel() for p in netG.parameters()):,}")
-print(f"Discriminator parameters: {sum(p.numel() for p in netD.parameters()):,}")
-
-# ── WGAN-GP Specific Optimisers (Using TTUR) ─────────────────────────────
-# WGAN-GP requires betas=(0.0, 0.9). 
-# We use TTUR (Two Time-Scale Update Rule) to train the Critic 
-# faster than the Generator to maintain stable gradients.
 LR_D = 0.0004
 LR_G = 0.0001
 BETAS_WGAN = (0.0, 0.9)
@@ -256,12 +228,12 @@ BETAS_WGAN = (0.0, 0.9)
 optimizerD = optim.Adam(netD.parameters(), lr=LR_D, betas=BETAS_WGAN)
 optimizerG = optim.Adam(netG.parameters(), lr=LR_G, betas=BETAS_WGAN)
 
-
-# %%
-# WGAN-GP specific hyperparameters
 CRITIC_ITERATIONS = 5
 LAMBDA_GP = 10.0
 
+
+# %%
+# ── Training Loop ─────────────────────────────────────────────────────────
 G_losses, D_losses = [], []
 
 for epoch in range(NUM_EPOCHS):
@@ -275,18 +247,14 @@ for epoch in range(NUM_EPOCHS):
         # ─── Update D (Critic): minimize -D(x) + D(G(z)) + λ*GP ──────────
         netD.zero_grad()
         
-        # Real pass
         d_real = netD(real_cpu, lbl).mean()
         
-        # Fake pass
         noise = torch.randn(batch_size, LATENT_DIM, 1, 1, device=device)
         fake = netG(noise, lbl)
         d_fake = netD(fake.detach(), lbl).mean()
         
-        # Gradient Penalty
         gp = compute_gradient_penalty(netD, real_cpu, fake.detach(), lbl, device)
         
-        # Total Critic Loss
         errD = -d_real + d_fake + LAMBDA_GP * gp
         errD.backward()
         optimizerD.step()
@@ -294,37 +262,28 @@ for epoch in range(NUM_EPOCHS):
         epoch_D += errD.item()
 
         # ─── Update G: minimize -D(G(z)) ─────────────────────────────────
-        # Train the generator only every CRITIC_ITERATIONS steps
         if i % CRITIC_ITERATIONS == 0:
             netG.zero_grad()
-            
-            # Generate new fake images
             noise = torch.randn(batch_size, LATENT_DIM, 1, 1, device=device)
             fake = netG(noise, lbl)
-            
-            # Generator Loss
             errG = -netD(fake, lbl).mean()
             errG.backward()
             optimizerG.step()
-            
             epoch_G += errG.item()
 
-        # ─── Print progress ──────────────────────────────────────────────
         if i % 50 == 0:
             print(f"[{epoch+1}/{NUM_EPOCHS}][{i}/{len(train_loader)}] "
                   f"Loss_D: {errD.item():.4f}  Loss_G: {errG.item():.4f}  "
                   f"D(x): {d_real.item():.4f}  D(G(z)): {d_fake.item():.4f}")
 
-    # Because G is updated less often, we divide by the actual number of G updates
     num_G_updates = max(1, len(train_loader) // CRITIC_ITERATIONS)
     G_losses.append(epoch_G / num_G_updates)
     D_losses.append(epoch_D / len(train_loader))
 
-    # ── Save generated samples every SAVE_EVERY epochs ───────────────────
+    # ── Checkpointing and Periodic Visualization ─────────────────────────
     if (epoch + 1) % SAVE_EVERY == 0 or epoch == NUM_EPOCHS - 1:
         netG.eval()
         with torch.no_grad():
-            # Generate 16 random classes to visualize
             sample_lbl  = torch.arange(min(16, NUM_CLASSES), device=device)
             noise_fixed = torch.randn(len(sample_lbl), LATENT_DIM, 1, 1, device=device)
             fake_sample = (netG(noise_fixed, sample_lbl).detach().cpu() + 1) * 0.5
@@ -345,7 +304,7 @@ print("Training complete.")
 
 
 # %%
-# ── Plot Generator and Discriminator loss curves ──────────────────────────
+# ── Evaluation: Loss Curves ──────────────────────────────────────────────
 plt.figure(figsize=(10, 5))
 plt.plot(G_losses, label="Generator")
 plt.plot(D_losses, label="Discriminator (Critic)")
@@ -355,6 +314,52 @@ plt.ylabel("Loss")
 plt.legend()
 plt.grid(True, alpha=0.3)
 plt.show()
+
+
+# %%
+# ── Sample Generation and Dataset Balancing ───────────────────────────────
+load_checkpoint(NETG_PATH, netG, device)
+netG = netG.to(device)
+netG.eval()
+
+class_counts = Counter(train_df["label"].tolist())
+TARGET_PER_CLASS = max(class_counts.values())
+
+generated_records = []
+with torch.no_grad():
+    for class_name, class_idx in label_to_idx.items():
+        existing = class_counts.get(class_name, 0)
+        n_gen = max(0, TARGET_PER_CLASS - existing)
+        if n_gen == 0:
+            continue
+
+        all_gen = []
+        remaining = n_gen
+        while remaining > 0:
+            batch_n = min(remaining, BATCH_SIZE)
+            noise = torch.randn(batch_n, LATENT_DIM, 1, 1, device=device)
+            lbl   = torch.full((batch_n,), class_idx, dtype=torch.long, device=device)
+            gen   = netG(noise, lbl).cpu()
+            all_gen.append(gen)
+            remaining -= batch_n
+
+        gen_imgs = torch.cat(all_gen, dim=0)
+        gen_imgs = (gen_imgs * 0.5 + 0.5).clamp(0, 1)
+
+        for j, img_t in enumerate(gen_imgs):
+            fname = f"wgan_gp_{class_idx:03d}_{j:04d}.jpg"
+            tensor_to_pil(img_t).save(os.path.join(SAVE_DIR, fname))
+            generated_records.append({
+                "filename": fname,
+                "label": class_name,
+                "img_dir": SAVE_DIR,
+            })
+
+        print(f"  [{class_idx:02d}] {class_name}: generated {n_gen}")
+
+gen_df = pd.DataFrame(generated_records)
+gen_df.to_csv(os.path.join(SAVE_DIR, "generated.csv"), index=False)
+print(f"\nTotal generated: {len(gen_df):,}  |  CSV saved.")
 
 
 # %%

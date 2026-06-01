@@ -1,6 +1,6 @@
 """
 utils.py
-Shared helper utilities: checkpoints, visualization, tensor helpers.
+Shared infrastructure for model persistence, data visualization, and training telemetry.
 """
 
 import os
@@ -11,54 +11,33 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from torchvision.utils import make_grid
 
-
-# ---------------------------------------------------------------------------
-# Checkpoint helpers
-# ---------------------------------------------------------------------------
-
 def save_checkpoint(model: torch.nn.Module, path: str, **extra) -> None:
-    """Save model state dict and any extra metadata (e.g. epoch, loss)."""
+    """Persist model state dictionary and associated metadata to disk."""
     os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
     payload = {"state_dict": model.state_dict()}
     payload.update(extra)
     torch.save(payload, path)
     print(f"[checkpoint] saved → {path}")
 
-
 def load_checkpoint(path: str, model: torch.nn.Module, device: torch.device = None):
-    """Load state dict into model inplace. Returns the full payload dict."""
+    """Restore model state from a saved checkpoint. Returns the full payload."""
     device = device or torch.device("cpu")
     payload = torch.load(path, map_location=device)
     model.load_state_dict(payload["state_dict"])
     print(f"[checkpoint] loaded ← {path}")
     return payload
 
-
-# ---------------------------------------------------------------------------
-# Tensor normalization helpers
-# ---------------------------------------------------------------------------
-
 def denormalize(tensor: torch.Tensor) -> torch.Tensor:
     """
-    Undo Normalize((0.5,0.5,0.5),(0.5,0.5,0.5)) applied during data loading.
-    Maps [-1, 1] → [0, 1].
-    Works on batched (N,C,H,W) or single (C,H,W) tensors.
+    Invert Tanh-range normalization: maps [-1, 1] back to [0, 1].
+    Supports both single (C, H, W) and batched (N, C, H, W) tensors.
     """
     return (tensor * 0.5 + 0.5).clamp(0, 1)
 
-
 def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
-    """
-    Convert a (C,H,W) float tensor in [0,1] to a PIL Image.
-    Call denormalize() first if tensor is in [-1,1].
-    """
+    """Convert a normalized [0, 1] torch tensor to a PIL Image object."""
     arr = (tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
     return Image.fromarray(arr)
-
-
-# ---------------------------------------------------------------------------
-# Visualization
-# ---------------------------------------------------------------------------
 
 def visualize_grid(
     images: torch.Tensor,
@@ -70,16 +49,16 @@ def visualize_grid(
     denorm: bool = True,
 ) -> None:
     """
-    Display a grid of images.
-
+    Render a composite grid of images with optional label annotations.
+    
     Args:
-        images      : (N, C, H, W) tensor, optionally normalized to [-1,1]
-        labels      : integer class indices for each image
-        idx_to_label: mapping from index to human-readable string
-        n           : how many images to show
-        nrow        : images per row
-        title       : plot title
-        denorm      : if True, apply denormalize() before display
+        images: Input tensor (N, C, H, W).
+        labels: Ground truth or predicted class indices.
+        idx_to_label: Mapping for human-readable label resolution.
+        n: Total samples to visualize.
+        nrow: Number of samples per grid row.
+        title: Figure title.
+        denorm: Flag to trigger inverse normalization before display.
     """
     imgs = images[:n].cpu()
     if denorm:
@@ -100,7 +79,6 @@ def visualize_grid(
     plt.tight_layout()
     plt.show()
 
-
 def plot_losses(
     train_losses: list,
     val_losses: list,
@@ -108,7 +86,7 @@ def plot_losses(
     ylabel: str = "Loss",
     title: str = "Training curve",
 ) -> None:
-    """Plot train vs. validation loss curves."""
+    """Generate training vs. validation loss convergence plots."""
     plt.figure(figsize=(8, 4))
     plt.plot(train_losses, label="Train")
     plt.plot(val_losses, label="Val")
@@ -119,21 +97,9 @@ def plot_losses(
     plt.tight_layout()
     plt.show()
 
-
-# ---------------------------------------------------------------------------
-# Early stopping
-# ---------------------------------------------------------------------------
-
 class EarlyStopping:
     """
-    Monitors a validation metric and signals when training should stop.
-
-    Usage:
-        es = EarlyStopping(patience=10, min_delta=1e-4)
-        for epoch in ...:
-            val_loss = ...
-            if es(val_loss):
-                break
+    Monitor validation metrics to prevent overfitting through automated training termination.
     """
 
     def __init__(self, patience: int = 10, min_delta: float = 1e-4, mode: str = "min"):
@@ -159,12 +125,8 @@ class EarlyStopping:
                 self.should_stop = True
         return self.should_stop
 
-
-# ---------------------------------------------------------------------------
-# Device helper
-# ---------------------------------------------------------------------------
-
 def get_device() -> torch.device:
+    """Detect and return the optimal available compute device (CUDA, MPS, or CPU)."""
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():

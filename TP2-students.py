@@ -79,20 +79,20 @@ class ButterflyDataset(data.Dataset):
 
 
 # %% [markdown]
-# ## First, we read the dataset, preprocess the images and encapsulate them into dataloader form.
+# ## Dataset Initialization
+# Load training metadata, apply base transformations, and initialize DataLoaders.
 
 # %%
-# load the data
+# Load dataset metadata and configure base transforms
 img_dir = os.path.join(path, 'train')
 df = pd.read_csv(os.path.join(path, 'train.csv'))
 
-# preprocessing
 data_transform = transforms.Compose([
     transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
     transforms.ToTensor()
 ])
 
-# encapsulate data into dataloader form
+# Initialize Dataset and DataLoader
 dataset = ButterflyDataset(df=df, img_dir=img_dir, transform=data_transform)
 dataloader = data.DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
@@ -101,7 +101,7 @@ print(f"Number of samples: {len(dataset)}")
 print(f"Number of classes: {len(dataset.classes)}")
 
 # %%
-# Get a batch of images from the dataloader
+# Sample visualization of the input batch
 images, labels = next(iter(dataloader))
 
 fig, axes = plt.subplots(4, 8, figsize=(16, 8))
@@ -119,7 +119,8 @@ plt.tight_layout()
 plt.show()
 
 # %% [markdown]
-# # Classifier
+# # Classifier Architecture
+# Baseline CNN with residual-style convolutional blocks and a dense MLP classifier.
 
 # %%
 import torch.nn as nn
@@ -157,26 +158,27 @@ class BaselineCNN(nn.Module):
         x = torch.flatten(x, 1)
         return self.classifier(x)
 
-
 # %%
+# Model, Optimizer, and Loss Function initialization
 n_classes = len(dataset.classes)
 model = BaselineCNN(num_classes=n_classes)
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 criterion = nn.CrossEntropyLoss()
 
 # %% [markdown]
-# ## Train / Validation / Test Split
-# Stratified 70 / 15 / 15 split — `random_state=42` for reproducibility.
+# ## Dataset Partitioning
+# Stratified 70/15/15 split for balanced training, validation, and testing.
 
 # %%
 from sklearn.model_selection import train_test_split
 
-# Stratified 70/15/15 split — seed=42 (same as generative notebooks)
+# Execute stratified split (seed=42 for reproducibility)
 train_df, temp_df = train_test_split(df, test_size=0.30, stratify=df['label'], random_state=42)
 val_df, test_df   = train_test_split(temp_df, test_size=0.50, stratify=temp_df['label'], random_state=42)
 
 print(f"Train: {len(train_df):,}  Val: {len(val_df):,}  Test: {len(test_df):,}")
 
+# Initialize stratified datasets and loaders
 train_set = ButterflyDataset(train_df, img_dir, transform=data_transform)
 val_set   = ButterflyDataset(val_df,   img_dir, transform=data_transform)
 test_set  = ButterflyDataset(test_df,  img_dir, transform=data_transform)
@@ -186,12 +188,13 @@ val_loader   = data.DataLoader(val_set,   batch_size=BATCH_SIZE, shuffle=False)
 test_loader  = data.DataLoader(test_set,  batch_size=BATCH_SIZE, shuffle=False)
 
 # %% [markdown]
-# ## Training Loop
-# GPU-aware training with validation and early stopping.
+# ## Training Procedure
+# Supervised training loop with Early Stopping based on validation accuracy.
 
 # %%
 import os
 
+# Device configuration (CUDA / MPS / CPU)
 device = torch.device(
     "cuda" if torch.cuda.is_available() else
     "mps"  if torch.backends.mps.is_available() else
@@ -210,7 +213,7 @@ no_improve   = 0
 train_losses, val_losses, val_accs = [], [], []
 
 for epoch in range(NUM_EPOCHS):
-    # ── Train ────────────────────────────────────────────────────────────
+    # Training Phase
     model.train()
     running_loss = 0.0
     for imgs, labels in train_loader:
@@ -223,7 +226,7 @@ for epoch in range(NUM_EPOCHS):
     avg_train = running_loss / len(train_loader)
     train_losses.append(avg_train)
 
-    # ── Validate ─────────────────────────────────────────────────────────
+    # Validation Phase
     model.eval()
     val_loss, correct, total = 0.0, 0, 0
     with torch.no_grad():
@@ -242,7 +245,7 @@ for epoch in range(NUM_EPOCHS):
     print(f"Epoch {epoch+1:3d}/{NUM_EPOCHS}  "
           f"Train Loss: {avg_train:.4f}  Val Loss: {avg_val:.4f}  Val Acc: {acc:.4f}")
 
-    # Save best checkpoint
+    # Checkpoint logic: save state if validation accuracy improves
     if acc > best_val_acc:
         best_val_acc = acc
         torch.save(model.state_dict(), "saved_models/baseline.pth")

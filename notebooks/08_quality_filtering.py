@@ -13,6 +13,16 @@
 #     name: python3
 # ---
 
+# %% [markdown]
+# # Synthetic Data Quality Filtering (Oracle)
+# ### Automated refinement of generated datasets using a pretrained ResNet18 Oracle.
+#
+# Implementation details:
+# - Phase A: Fine-tune a ResNet18 Oracle on the real training distribution.
+# - Phase B: Score all generated samples across models (cVAE, GAN, etc.).
+# - Filtering: Preserving samples where (Oracle Prediction == Intended Class) AND (Softmax Confidence >= Threshold).
+#
+
 # %%
 import os, sys
 import torch
@@ -23,7 +33,7 @@ import pandas as pd
 from tqdm import tqdm
 
 # %%
-# Add project root to path
+# ── Project Path Setup ────────────────────────────────────────────────────
 sys.path.insert(0, os.path.abspath(".."))
 
 from src.dataset import (
@@ -33,28 +43,28 @@ from src.dataset import (
 from src.utils import save_checkpoint, load_checkpoint
 
 # %%
-# ── Device setup ──────────────────────────────────────────────────────────
+# ── Device Configuration ──────────────────────────────────────────────────
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # %%
-# ── Configuration ──────────────────────────────────────────────────────────
+# ── Hyperparameters and Paths ──────────────────────────────────────────────
 BASE_DIR       = os.path.abspath("..")
 CSV_PATH       = os.path.join(BASE_DIR, "aca-butterflies", "train.csv")
 IMG_DIR        = os.path.join(BASE_DIR, "aca-butterflies", "train")
 ORACLE_PATH    = os.path.join(BASE_DIR, "saved_models", "oracle_resnet18.pth")
 
-CONF_THRESHOLD = 0.6   # Lowered from 0.8 as ResNet is more "certain" but synth data is imperfect
+CONF_THRESHOLD = 0.6
 BATCH_SIZE     = 64
 IMAGE_SIZE     = 64
-NUM_EPOCHS     = 15    # Enough for fine-tuning ResNet18
+NUM_EPOCHS     = 15
 LR             = 1e-4
 
 GENERATIVE_MODELS = ["cvae", "gan", "wgan_gp", "biggan", "diffusion"]
 
 # %%
 def get_oracle_model(num_classes):
-    """Returns a pre-trained ResNet18 with modified final layer."""
+    """Initialize ResNet18 with modified classification head for target classes."""
     model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
     num_ftrs = model.fc.in_features
     model.fc = nn.Linear(num_ftrs, num_classes)
@@ -62,7 +72,7 @@ def get_oracle_model(num_classes):
 
 # %%
 def train_oracle():
-    """Phase A: Train a strong Oracle on the real training set."""
+    """Train the Oracle model on the real dataset to establish a reference distribution classifier."""
     label_to_idx, idx_to_label = build_label_map(CSV_PATH)
     num_classes = len(label_to_idx)
     
@@ -71,10 +81,6 @@ def train_oracle():
         model = get_oracle_model(num_classes)
         load_checkpoint(ORACLE_PATH, model, device)
         return model
-
-    print("\n" + "="*50)
-    print("PHASE A: Training Oracle (ResNet18) on real data...")
-    print("="*50)
 
     train_df, val_df, _ = get_splits(CSV_PATH, train_ratio=0.8, val_ratio=0.2, seed=42)
     
@@ -100,7 +106,6 @@ def train_oracle():
             optimizer.step()
             running_loss += loss.item()
             
-        # Validate
         model.eval()
         correct, total = 0, 0
         with torch.no_grad():
@@ -117,17 +122,12 @@ def train_oracle():
             best_acc = acc
             save_checkpoint(model, ORACLE_PATH, epoch=epoch+1, val_acc=acc)
             
-    print(f"Oracle training complete. Best Val Acc: {best_acc:.4f}")
     load_checkpoint(ORACLE_PATH, model, device)
     return model
 
 # %%
 def filter_images(model):
-    """Phase B: Use Oracle to filter generated datasets."""
-    print("\n" + "="*50)
-    print(f"PHASE B: Filtering generated images (Threshold: {CONF_THRESHOLD})...")
-    print("="*50)
-
+    """Prune synthetic datasets by removing samples that fail Oracle class verification."""
     label_to_idx, _ = build_label_map(CSV_PATH)
     model.eval()
 
@@ -157,14 +157,14 @@ def filter_images(model):
                     intended_idx = labels[j].item()
                     confidence = conf[j].item()
                     
-                    # Keep if prediction matches intended label AND confidence is high
+                    # Accept if prediction aligns with intent and meets confidence threshold
                     is_kept = (predicted_idx == intended_idx) and (confidence >= CONF_THRESHOLD)
                     results.append(is_kept)
 
         df_filtered = df[results].copy()
         df_filtered.to_csv(csv_out, index=False)
         
-        print(f"  {gen_model.upper()}: Kept {len(df_filtered)}/{len(df)} ({len(df_filtered)/len(df)*100:.1f}%) images.")
+        print(f"  {gen_model.upper()}: Retained {len(df_filtered)}/{len(df)} ({len(df_filtered)/len(df)*100:.1f}%) samples.")
 
 # %%
 if __name__ == "__main__":

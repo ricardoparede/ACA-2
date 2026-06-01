@@ -17,16 +17,11 @@
 # # Conditional Variational AutoEncoder (cVAE)
 # ### Butterfly Dataset — 75-class conditional image generation
 #
-# Follows the AUTOENCODER.py example pattern from `exemplos_modelos/`:
-# - Class-based model definition (Encoder / Decoder / cVAE)
-# - `train()` function that returns model + loss history
-# - Visualisation helpers mirroring `plot_results()`
-#
-# Extensions over the base example:
-# - **Convolutional** encoder/decoder (instead of linear)
-# - **Class conditioning** via `nn.Embedding` (required for 75-class generation)
-# - **ELBO loss** = MSE + λ·Perceptual + β·KL (β annealed to avoid posterior collapse)
-# - **GPU training** (cuda → mps → cpu fallback, same as all example files)
+# Implementation details:
+# - Convolutional encoder/decoder architecture
+# - Class conditioning via `nn.Embedding` (latent injection)
+# - ELBO objective: MSE + λ·Perceptual + β·KL
+# - GPU acceleration (CUDA/MPS) support
 #
 
 # %%
@@ -41,7 +36,7 @@ import matplotlib.pyplot as plt
 from collections import Counter
 import pandas as pd
 
-# ── Device setup (following exemplos_modelos pattern) ──────────────────────
+# ── Device Configuration ──────────────────────────────────────────────────
 device = torch.device(
     "cuda"  if torch.cuda.is_available()  else
     "mps"   if torch.backends.mps.is_available() else
@@ -51,7 +46,7 @@ print(f"Using device: {device}")
 
 
 # %%
-# ── Add project root to path so src/ is importable ────────────────────────
+# ── Project Path Setup ────────────────────────────────────────────────────
 sys.path.insert(0, os.path.abspath(".."))
 
 from src.dataset import (
@@ -67,7 +62,7 @@ from src.metrics import compute_fid, compute_inception_score, compute_ssim
 
 
 # %%
-# ── Configuration ──────────────────────────────────────────────────────────
+# ── Hyperparameters and Paths ──────────────────────────────────────────────
 BASE_DIR   = os.path.abspath("..")
 IMG_DIR    = os.path.join(BASE_DIR, "aca-butterflies", "train")
 CSV_PATH   = os.path.join(BASE_DIR, "aca-butterflies", "train.csv")
@@ -75,25 +70,21 @@ SAVE_DIR   = os.path.join(BASE_DIR, "data", "generated", "cvae")
 MODEL_PATH = os.path.join(BASE_DIR, "saved_models", "cvae_checkpoint.pth")
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# Hyperparameters
 IMAGE_SIZE    = 64
 BATCH_SIZE    = 64
 LATENT_DIM    = 128
 NUM_CLASSES   = 75
 EMB_DIM       = 32
 
-# Training
 LR            = 3e-4
 WEIGHT_DECAY  = 1e-5
-NUM_EPOCHS    = 150      # extended: model hadn't plateaued at 100
-ES_PATIENCE   = 30       # more patience to let LR scheduler do its work
+NUM_EPOCHS    = 150
+ES_PATIENCE   = 30
 
-# LR scheduler: halve LR when val_recon doesn't improve for LR_PATIENCE epochs
 LR_PATIENCE   = 10
 LR_FACTOR     = 0.5
-LR_MIN        = 1e-6     # floor so LR doesn't go to zero
+LR_MIN        = 1e-6
 
-# Loss weights
 BETA          = 0.5
 LAMBDA_PERC   = 0.001
 GRAD_CLIP     = 1.0
@@ -101,7 +92,7 @@ FREE_BITS     = 0.2
 
 
 # %%
-# ── Data loading ───────────────────────────────────────────────────────────
+# ── Dataset Initialization ────────────────────────────────────────────────
 label_to_idx, idx_to_label = build_label_map(CSV_PATH)
 num_classes = len(label_to_idx)
 print(f"Classes: {num_classes}")
@@ -117,11 +108,9 @@ train_loader = make_dataloader(train_set, BATCH_SIZE, shuffle=True)
 val_loader   = make_dataloader(val_set,   BATCH_SIZE, shuffle=False)
 test_loader  = make_dataloader(test_set,  BATCH_SIZE, shuffle=False)
 
-print(f"Batches — Train: {len(train_loader)}  Val: {len(val_loader)}")
-
 
 # %%
-# ── Visualise a training batch ─────────────────────────────────────────────
+# ── Batch Visualization ───────────────────────────────────────────────────
 imgs, labs = next(iter(train_loader))
 visualize_grid(imgs, labs, idx_to_label, n=16, nrow=8,
                title="Training samples (random batch)", denorm=True)
@@ -131,26 +120,20 @@ visualize_grid(imgs, labs, idx_to_label, n=16, nrow=8,
 # ## Model Architecture
 #
 # ### Encoder
-# `Image (3×64×64)` + `class embedding (64-dim)`
-# → Conv blocks (3→64→128→256, stride-2) → Flatten → FC(16448, 512) → **μ, log σ²** (128-dim each)
+# Maps `Image (3×64×64)` + `class embedding` to latent distribution parameters (**μ, log σ²**).
 #
 # ### Decoder
-# `z (128-dim)` + `class embedding (64-dim)`
-# → FC(192, 16384) → Reshape (256×8×8) → ConvTranspose blocks (256→128→64→3) → **Tanh output**
-#
-# Conditioning is applied via `nn.Embedding(75, 64)` injected at both the encoder (after flattening)
-# and the decoder (before the FC projection), following the approach from the course examples.
+# Maps `latent z` + `class embedding` to reconstructed `Image (3×64×64)` via ConvTranspose blocks.
 #
 
 # %%
 class Encoder(nn.Module):
-    """Convolutional encoder with class conditioning."""
+    """Convolutional encoder with class conditioning bottleneck."""
 
     def __init__(self, latent_dim=LATENT_DIM, num_classes=NUM_CLASSES, emb_dim=EMB_DIM):
         super().__init__()
         self.class_emb = nn.Embedding(num_classes, emb_dim)
 
-        # Conv feature extractor — mirrors Discriminator pattern in GAN.py
         self.conv = nn.Sequential(
             nn.Conv2d(3, 64, 4, stride=2, padding=1),           # 64→32
             nn.LeakyReLU(0.2, inplace=True),
@@ -171,28 +154,22 @@ class Encoder(nn.Module):
         self.fc_logvar = nn.Linear(512, latent_dim)
 
     def forward(self, x, label):
-        h = self.conv(x).view(x.size(0), -1)                    # (B, 16384)
-        c = self.class_emb(label)                                # (B, emb_dim)
-        h = self.fc(torch.cat([h, c], dim=1))                   # (B, 512)
+        h = self.conv(x).view(x.size(0), -1)
+        c = self.class_emb(label)
+        h = self.fc(torch.cat([h, c], dim=1))
         return self.fc_mu(h), self.fc_logvar(h)
 
 
 
 # %%
 class Decoder(nn.Module):
-    """Convolutional decoder with class conditioning.
-    Uses InstanceNorm instead of BatchNorm: InstanceNorm normalises per-sample,
-    preserving class-specific features. BatchNorm averages across the batch
-    which blurs class details when different butterfly species are in the same batch.
-    """
+    """Convolutional decoder with class conditioning and InstanceNorm."""
 
     def __init__(self, latent_dim=LATENT_DIM, num_classes=NUM_CLASSES, emb_dim=EMB_DIM):
         super().__init__()
         self.class_emb = nn.Embedding(num_classes, emb_dim)
         self.fc = nn.Linear(latent_dim + emb_dim, 256 * 8 * 8)
 
-        # ConvTranspose upsampler — mirrors Generator pattern in GAN.py
-        # InstanceNorm2d(affine=True) preserves per-sample statistics → sharper class details
         self.deconv = nn.Sequential(
             nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),  # 8→16
             nn.InstanceNorm2d(128, affine=True),
@@ -205,16 +182,16 @@ class Decoder(nn.Module):
         )
 
     def forward(self, z, label):
-        c = self.class_emb(label)                                # (B, emb_dim)
-        h = self.fc(torch.cat([z, c], dim=1))                   # (B, 256*8*8)
-        h = h.view(-1, 256, 8, 8)                               # (B, 256, 8, 8)
-        return self.deconv(h)                                    # (B, 3, 64, 64)
+        c = self.class_emb(label)
+        h = self.fc(torch.cat([z, c], dim=1))
+        h = h.view(-1, 256, 8, 8)
+        return self.deconv(h)
 
 
 
 # %%
 class ConditionalVAE(nn.Module):
-    """cVAE: combines Encoder + reparameterisation trick + Decoder."""
+    """Conditional Variational AutoEncoder core."""
 
     def __init__(self, latent_dim=LATENT_DIM, num_classes=NUM_CLASSES, emb_dim=EMB_DIM):
         super().__init__()
@@ -223,8 +200,7 @@ class ConditionalVAE(nn.Module):
         self.latent_dim = latent_dim
 
     def reparameterize(self, mu, logvar):
-        """z = mu + eps * sigma,  eps ~ N(0, I)"""
-        # Clamp logvar to prevent exp() overflow → NaN
+        """Apply reparameterization trick: z = mu + eps * sigma."""
         logvar = logvar.clamp(-4, 15)
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
@@ -238,7 +214,7 @@ class ConditionalVAE(nn.Module):
 
     @torch.no_grad()
     def generate(self, labels: torch.Tensor) -> torch.Tensor:
-        """Sample from the prior N(0, I) and decode for given class labels."""
+        """Generate samples from N(0, I) prior for target classes."""
         z = torch.randn(len(labels), self.latent_dim, device=labels.device)
         return self.decoder(z, labels)
 
@@ -246,25 +222,18 @@ class ConditionalVAE(nn.Module):
 
 # %%
 class PerceptualLoss(nn.Module):
-    """
-    Feature-level loss using VGG16 up to relu2_2.
-    Input tensors must be in [-1, 1] (will be rescaled internally).
-    Mitigates the blurriness that plain MSE reconstruction causes in VAEs.
-    """
+    """Feature-level reconstruction loss using pretrained VGG16 features."""
 
     def __init__(self):
         super().__init__()
         vgg = models.vgg16(weights=models.VGG16_Weights.DEFAULT).features
-        # Layers 0-8 correspond to relu2_2
         self.slice = nn.Sequential(*list(vgg.children())[:9])
         for p in self.slice.parameters():
             p.requires_grad = False
-        # ImageNet normalisation buffers
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("std",  torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
     def forward(self, x, target):
-        # [-1,1] → [0,1] → ImageNet normalised
         x      = ((x      + 1) / 2 - self.mean) / self.std
         target = ((target + 1) / 2 - self.mean) / self.std
         return F.mse_loss(self.slice(x), self.slice(target))
@@ -273,11 +242,7 @@ class PerceptualLoss(nn.Module):
 
 # %%
 def vae_loss(recon, x, mu, logvar, perceptual_fn, beta=BETA, lambda_perc=LAMBDA_PERC):
-    """
-    ELBO loss for the cVAE.
-    Fixed: Calculates sum over feature dimensions, and mean over the batch.
-    """
-    # 1. MSE: Sum over pixels (C, H, W), then mean over the batch (B)
+    """Compute ELBO objective: Reconstruction (MSE + Perceptual) + KL Divergence."""
     mse_per_sample = F.mse_loss(recon, x, reduction="none").view(x.size(0), -1).sum(dim=1)
     mse = mse_per_sample.mean()
 
@@ -288,12 +253,10 @@ def vae_loss(recon, x, mu, logvar, perceptual_fn, beta=BETA, lambda_perc=LAMBDA_
         
     recon_loss = mse + lambda_perc * perc
 
-    # 2. KL Divergence: Apply free bits per dim, sum over latent dims, then mean over batch
     kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
     kl_per_dim = torch.clamp(kl_per_dim, min=FREE_BITS)
     kl = kl_per_dim.sum(dim=1).mean()
 
-    # 3. Total Loss
     total = recon_loss + beta * kl
     return total, recon_loss, mse.item(), perc.item(), kl.item()
 
@@ -302,14 +265,7 @@ def vae_loss(recon, x, mu, logvar, perceptual_fn, beta=BETA, lambda_perc=LAMBDA_
 def train_cvae(model, train_loader, val_loader, perceptual_fn,
                num_epochs=NUM_EPOCHS, lr=LR, weight_decay=WEIGHT_DECAY,
                es_patience=ES_PATIENCE, grad_clip=GRAD_CLIP, device=device):
-    """
-    Training loop for the cVAE.
-    Follows the train() function structure from exemplos_modelos/AUTOENCODER.py.
-    Uses a fixed beta=BETA (no annealing) for a stable KL signal from epoch 1.
-    Early stopping and checkpointing use val_recon (MSE + λ·Perc, no KL).
-    ReduceLROnPlateau halves the LR when val_recon stops improving — more
-    effective than just adding more epochs at a fixed learning rate.
-    """
+    """Execute cVAE training loop with early stopping and LR scheduling."""
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=LR_FACTOR,
@@ -324,7 +280,7 @@ def train_cvae(model, train_loader, val_loader, perceptual_fn,
     best_val_recon = float("inf")
 
     for epoch in range(num_epochs):
-        # ── Train ─────────────────────────────────────────────────────────
+        # ── Training Phase ────────────────────────────────────────────────
         model.train()
         running_loss = 0.0
         for i, (imgs, labels) in enumerate(train_loader):
@@ -349,7 +305,7 @@ def train_cvae(model, train_loader, val_loader, perceptual_fn,
         avg_train = running_loss / len(train_loader)
         train_losses.append(avg_train)
 
-        # ── Validate ──────────────────────────────────────────────────────
+        # ── Validation Phase ──────────────────────────────────────────────
         model.eval()
         val_loss = 0.0
         val_recon_sum = 0.0
@@ -366,11 +322,9 @@ def train_cvae(model, train_loader, val_loader, perceptual_fn,
         avg_val_recon = val_recon_sum / len(val_loader)
         val_losses.append(avg_val)
 
-        current_lr = optimizer.param_groups[0]["lr"]
         print(f"Epoch: {epoch+1}  Train Loss: {avg_train:.4f}  "
-              f"Val Loss: {avg_val:.4f}  Val Recon: {avg_val_recon:.4f}  lr: {current_lr:.2e}")
+              f"Val Loss: {avg_val:.4f}  Val Recon: {avg_val_recon:.4f}")
 
-        # Step scheduler on val_recon — reduces LR when plateau detected
         scheduler.step(avg_val_recon)
 
         if avg_val_recon < best_val_recon:
@@ -386,7 +340,7 @@ def train_cvae(model, train_loader, val_loader, perceptual_fn,
 
 
 # %%
-# ── Instantiate and train (mirrors AUTOENCODER.py usage pattern) ───────────
+# ── Model Initialization and Training ──────────────────────────────────────
 cvae = ConditionalVAE(LATENT_DIM, NUM_CLASSES, EMB_DIM)
 perceptual_fn = PerceptualLoss()
 
@@ -399,13 +353,7 @@ cvae, train_losses, val_losses = train_cvae(
 
 
 # %%
-# ── Plot training curves (mirrors plot_results() in AUTOENCODER.py) ────────
-plot_losses(train_losses, val_losses, title="cVAE Training Curve — ELBO Loss")
-
-
-# %%
-# ── Visualise reconstructions (side-by-side: original vs reconstruction) ───
-# Follows the two-row grid style of AUTOENCODER.py plot_results()
+# ── Visual Evaluation: Reconstructions ─────────────────────────────────────
 load_checkpoint(MODEL_PATH, cvae, device)
 cvae = cvae.to(device)
 cvae.eval()
@@ -429,11 +377,9 @@ plt.show()
 
 
 # %%
-# ── Generate images per class (balance dataset to largest class count) ─────
+# ── Sample Generation and Dataset Balancing ───────────────────────────────
 class_counts = Counter(train_df["label"].tolist())
 TARGET_PER_CLASS = max(class_counts.values())
-print(f"Max images in one class: {TARGET_PER_CLASS}")
-print(f"Will generate up to {TARGET_PER_CLASS} images per under-represented class")
 
 cvae.eval()
 generated_records = []
@@ -445,17 +391,16 @@ with torch.no_grad():
         if n_gen == 0:
             continue
 
-        # Generate in mini-batches to avoid OOM on large n_gen
         all_gen = []
         remaining = n_gen
         while remaining > 0:
             batch_n = min(remaining, BATCH_SIZE)
             lbl = torch.full((batch_n,), class_idx, dtype=torch.long, device=device)
-            gen = cvae.generate(lbl)                # (batch_n, 3, 64, 64)
+            gen = cvae.generate(lbl)
             all_gen.append(gen.cpu())
             remaining -= batch_n
-        gen_imgs = torch.cat(all_gen, dim=0)        # (n_gen, 3, 64, 64)
-        gen_imgs = (gen_imgs * 0.5 + 0.5).clamp(0, 1)  # [-1,1] → [0,1]
+        gen_imgs = torch.cat(all_gen, dim=0)
+        gen_imgs = (gen_imgs * 0.5 + 0.5).clamp(0, 1)
 
         for j, img_t in enumerate(gen_imgs):
             fname = f"cvae_{class_idx:03d}_{j:04d}.jpg"
@@ -470,7 +415,6 @@ with torch.no_grad():
 
 gen_df = pd.DataFrame(generated_records)
 gen_df.to_csv(os.path.join(SAVE_DIR, "generated.csv"), index=False)
-print(f"\nTotal generated: {len(gen_df):,}  |  Saved CSV → {SAVE_DIR}/generated.csv")
 
 
 # %%

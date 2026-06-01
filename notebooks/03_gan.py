@@ -17,14 +17,11 @@
 # # Conditional DCGAN (cGAN)
 # ### Butterfly Dataset — 75-class conditional image generation
 #
-# Follows the GAN.py example pattern from `exemplos_modelos/` very closely:
-# - Same variable names: `netG`, `netD`, `optimizerG`, `optimizerD`, `criterion`
-# - Same Adam settings: `lr=0.0002, betas=(0.5, 0.999)`
-# - Same training loop structure and per-batch print format
-# - Same `real_label / fake_label` convention (with label smoothing: real=0.9)
-#
-# Extension over the example: **class conditioning** via `nn.Embedding` injected into
-# both Generator (noise concatenation) and Discriminator (spatial projection).
+# Implementation details:
+# - Standard DCGAN architecture adapted for class conditioning
+# - Class conditioning via `nn.Embedding` (concatenation in G, spatial projection in D)
+# - Spectral normalization applied to Discriminator for stability
+# - BCE loss with logits for numerical stability
 #
 
 # %%
@@ -39,7 +36,7 @@ from collections import Counter
 import pandas as pd
 from torch.nn.utils import spectral_norm
 
-# ── Device setup (following exemplos_modelos pattern) ──────────────────────
+# ── Device Configuration ──────────────────────────────────────────────────
 device = torch.device(
     "cuda"  if torch.cuda.is_available()  else
     "mps"   if torch.backends.mps.is_available() else
@@ -49,6 +46,7 @@ print(f"Using device: {device}")
 
 
 # %%
+# ── Project Path Setup ────────────────────────────────────────────────────
 sys.path.insert(0, os.path.abspath(".."))
 
 from src.dataset import (
@@ -64,7 +62,7 @@ from src.metrics import compute_fid, compute_inception_score
 
 
 # %%
-# ── Configuration ──────────────────────────────────────────────────────────
+# ── Hyperparameters and Paths ──────────────────────────────────────────────
 BASE_DIR    = os.path.abspath("..")
 IMG_DIR     = os.path.join(BASE_DIR, "aca-butterflies", "train")
 CSV_PATH    = os.path.join(BASE_DIR, "aca-butterflies", "train.csv")
@@ -73,22 +71,22 @@ NETG_PATH   = os.path.join(BASE_DIR, "saved_models", "gan_generator.pth")
 NETD_PATH   = os.path.join(BASE_DIR, "saved_models", "gan_discriminator.pth")
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# Hyperparameters — mirroring GAN.py where applicable
-IMAGE_SIZE  = 64        # matches TP2-students.ipynb
-BATCH_SIZE  = 64        # RTX 5060 Laptop 8.5 GB VRAM
-LATENT_DIM  = 100       # same as GAN.py noise dim
+IMAGE_SIZE  = 64
+BATCH_SIZE  = 64
+LATENT_DIM  = 100
 NUM_CLASSES = 75
-EMB_DIM     = 100       # class embedding fed into G; projected to spatial in D
+EMB_DIM     = 100
 
-LR          = 0.0002    # from GAN.py
-BETAS       = (0.5, 0.999)  # from GAN.py
+LR          = 0.0002
+BETAS       = (0.5, 0.999)
 NUM_EPOCHS  = 200
-SAVE_EVERY  = 20        # save checkpoint every N epochs
-real_label  = 0.9       # label smoothing (GAN.py uses 1; smoothing helps stability)
+SAVE_EVERY  = 20
+real_label  = 0.9
 fake_label  = 0.0
 
 
 # %%
+# ── Dataset Initialization ────────────────────────────────────────────────
 label_to_idx, idx_to_label = build_label_map(CSV_PATH)
 num_classes = len(label_to_idx)
 
@@ -98,10 +96,10 @@ print(f"Train: {len(train_df):,}  Val: {len(val_df):,}  Test: {len(test_df):,}")
 train_set    = ButterflyDataset(train_df, IMG_DIR, label_to_idx,
                                 transform=get_train_transform(IMAGE_SIZE))
 train_loader = make_dataloader(train_set, BATCH_SIZE, shuffle=True)
-print(f"Batches: {len(train_loader)}")
 
 
 # %%
+# ── Batch Visualization ───────────────────────────────────────────────────
 imgs, labs = next(iter(train_loader))
 visualize_grid(imgs, labs, idx_to_label, n=16, nrow=8,
                title="Training samples", denorm=True)
@@ -111,23 +109,16 @@ visualize_grid(imgs, labs, idx_to_label, n=16, nrow=8,
 # ## Model Architecture
 #
 # ### Generator (netG)
-# `noise (100-dim)` + `class embedding (100-dim)` → concat (200-dim) → reshape (200×1×1)
-# → ConvTranspose blocks: 200→256→128→64→32→3 → **Tanh** → `64×64×3` image
+# Maps `noise` + `class embedding` to `64×64×3` image via ConvTranspose blocks.
 #
 # ### Discriminator (netD)
-# `image (3×64×64)` + class embedding projected to `(1×64×64)` spatial map
-# → concat on channel dim → Conv blocks: 4→64→128→256→512→1 → **Sigmoid**
-#
-# This design closely follows the `Generator` and `Discriminator` in `exemplos_modelos/GAN.py`,
-# extended with class conditioning as described in the conditional GAN literature.
+# Binary classifier estimating probability of `real` image given `class label`.
+# Uses spectral normalization and spatial class projection.
 #
 
 # %%
 def weights_init(m):
-    """
-    Custom weight initialisation — standard for DCGAN.
-    Matches the initialisation strategy implied by GAN.py (default Conv/BN init).
-    """
+    """Initialize weights with N(0, 0.02) for Conv and N(1, 0.02) for BN."""
     classname = m.__class__.__name__
     if classname.find("Conv") != -1:
         nn.init.normal_(m.weight.data, 0.0, 0.02)
@@ -139,43 +130,40 @@ def weights_init(m):
 
 # %%
 class Generator(nn.Module):
-    """
-    Conditional Generator — extends GAN.py Generator with class conditioning.
-    Input: noise (LATENT_DIM,) + class_idx → output: (3, 64, 64) image in [-1,1].
-    """
+    """Conditional Generator: noise + class index to RGB image."""
 
     def __init__(self, latent_dim=LATENT_DIM, num_classes=NUM_CLASSES, emb_dim=EMB_DIM):
         super().__init__()
         self.class_emb = nn.Embedding(num_classes, emb_dim)
-        # Input to first ConvTranspose: latent_dim + emb_dim = 200
         in_ch = latent_dim + emb_dim
         self.main = nn.Sequential(
-            # Same ConvTranspose backbone as GAN.py Generator, adjusted for 64×64 output
-            nn.ConvTranspose2d(in_ch, 256, 4, 1, 0, bias=False),  # → 4×4
+            nn.ConvTranspose2d(in_ch, 256, 4, 1, 0, bias=False),
             nn.BatchNorm2d(256),
             nn.ReLU(True),
-            nn.ConvTranspose2d(256, 128, 4, 2, 1, bias=False),    # → 8×8
+            nn.ConvTranspose2d(256, 128, 4, 2, 1, bias=False),
             nn.BatchNorm2d(128),
             nn.ReLU(True),
-            nn.ConvTranspose2d(128, 64, 4, 2, 1, bias=False),     # → 16×16
+            nn.ConvTranspose2d(128, 64, 4, 2, 1, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(True),
-            nn.ConvTranspose2d(64, 32, 4, 2, 1, bias=False),      # → 32×32
+            nn.ConvTranspose2d(64, 32, 4, 2, 1, bias=False),
             nn.BatchNorm2d(32),
             nn.ReLU(True),
-            nn.ConvTranspose2d(32, 3, 4, 2, 1, bias=False),       # → 64×64
+            nn.ConvTranspose2d(32, 3, 4, 2, 1, bias=False),
             nn.Tanh(),
         )
 
     def forward(self, noise, label):
-        c = self.class_emb(label).unsqueeze(-1).unsqueeze(-1)      # (B, emb, 1, 1)
-        z = torch.cat([noise, c], dim=1)                           # (B, in_ch, 1, 1)
+        c = self.class_emb(label).unsqueeze(-1).unsqueeze(-1)
+        z = torch.cat([noise, c], dim=1)
         return self.main(z)
 
 
 
 # %%
 class Discriminator(nn.Module):
+    """Conditional Discriminator with Spectral Norm and spatial projection."""
+
     def __init__(self, num_classes=NUM_CLASSES, emb_dim=EMB_DIM, image_size=IMAGE_SIZE):
         super().__init__()
         self.image_size = image_size
@@ -185,7 +173,6 @@ class Discriminator(nn.Module):
             nn.Linear(emb_dim, image_size * image_size),
         )
         
-        # Wrapped Conv2d in spectral_norm and removed the final Sigmoid
         self.model = nn.Sequential(
             spectral_norm(nn.Conv2d(4, 64, 4, 2, 1, bias=False)),
             nn.LeakyReLU(0.2, inplace=True),
@@ -203,7 +190,6 @@ class Discriminator(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
             
             spectral_norm(nn.Conv2d(512, 1, 4, 1, 0, bias=False)),
-            # Removed nn.Sigmoid() here!
         )
 
     def forward(self, img, label):
@@ -214,7 +200,7 @@ class Discriminator(nn.Module):
 
 
 # %%
-# ── Instantiate exactly as in GAN.py ──────────────────────────────────────
+# ── Model Initialization and Optimizers ──────────────────────────────────
 netG = Generator(LATENT_DIM, NUM_CLASSES, EMB_DIM).to(device)
 netD = Discriminator(NUM_CLASSES, EMB_DIM, IMAGE_SIZE).to(device)
 netG.apply(weights_init)
@@ -223,56 +209,51 @@ netD.apply(weights_init)
 print(f"Generator parameters    : {sum(p.numel() for p in netG.parameters()):,}")
 print(f"Discriminator parameters: {sum(p.numel() for p in netD.parameters()):,}")
 
-# Optimisers — identical to GAN.py
 optimizerD = optim.Adam(netD.parameters(), lr=LR, betas=BETAS)
 optimizerG = optim.Adam(netG.parameters(), lr=LR, betas=BETAS)
 
-# Loss — identical to GAN.py
 criterion = nn.BCEWithLogitsLoss()
 
 
 # %%
-# ── Training loop — mirrors GAN.py structure closely ──────────────────────
-# Variable names and comments intentionally match GAN.py for clarity.
-
+# ── Training Loop ─────────────────────────────────────────────────────────
 G_losses, D_losses = [], []
 
 for epoch in range(NUM_EPOCHS):
     epoch_G, epoch_D = 0.0, 0.0
     for i, (data, labels) in enumerate(train_loader):
 
-        # ─── Update D: maximise log(D(x)) + log(1 - D(G(z))) ─────────────
-        # (mirrors GAN.py comment style verbatim)
+        # ─── Update D: maximize log(D(x)) + log(1 - D(G(z))) ─────────────
         netD.zero_grad()
-        real_cpu  = data.to(device)           # real images moved to GPU
+        real_cpu  = data.to(device)
         lbl       = labels.to(device)
         batch_size = real_cpu.size(0)
 
-        # Real image pass
+        # Real batch
         label = torch.full((batch_size,), real_label, dtype=torch.float, device=device)
         output    = netD(real_cpu, lbl)
         errD_real = criterion(output, label)
         errD_real.backward()
-        D_x = output.mean().item()
+        D_x = output.sigmoid().mean().item()
 
-        # Fake image pass
+        # Fake batch
         noise = torch.randn(batch_size, LATENT_DIM, 1, 1, device=device)
         fake  = netG(noise, lbl)
         label.fill_(fake_label)
         output    = netD(fake.detach(), lbl)
         errD_fake = criterion(output, label)
         errD_fake.backward()
-        D_G_z1    = output.mean().item()
+        D_G_z1    = output.sigmoid().mean().item()
         errD      = errD_real + errD_fake
         optimizerD.step()
 
-        # ─── Update G: maximise log(D(G(z))) ─────────────────────────────
+        # ─── Update G: maximize log(D(G(z))) ─────────────────────────────
         netG.zero_grad()
-        label.fill_(1.0)               # fake labels are real for G cost
+        label.fill_(1.0)
         output = netD(fake, lbl)
         errG   = criterion(output, label)
         errG.backward()
-        D_G_z2 = output.mean().item()
+        D_G_z2 = output.sigmoid().mean().item()
         optimizerG.step()
 
         epoch_G += errG.item()
@@ -286,7 +267,7 @@ for epoch in range(NUM_EPOCHS):
     G_losses.append(epoch_G / len(train_loader))
     D_losses.append(epoch_D / len(train_loader))
 
-    # ── Save generated samples every SAVE_EVERY epochs (mirrors GAN.py) ──
+    # ── Checkpointing and Periodic Visualization ─────────────────────────
     if (epoch + 1) % SAVE_EVERY == 0 or epoch == NUM_EPOCHS - 1:
         netG.eval()
         with torch.no_grad():
@@ -309,11 +290,57 @@ print("Training complete.")
 
 
 # %%
-# ── Plot Generator and Discriminator loss curves ──────────────────────────
+# ── Evaluation: Loss Curves ──────────────────────────────────────────────
 plot_losses(G_losses, D_losses, ylabel="Loss",
             title="cGAN Training Curve")
 plt.legend(["Generator", "Discriminator"])
 plt.show()
+
+
+# %%
+# ── Sample Generation and Dataset Balancing ───────────────────────────────
+load_checkpoint(NETG_PATH, netG, device)
+netG = netG.to(device)
+netG.eval()
+
+class_counts = Counter(train_df["label"].tolist())
+TARGET_PER_CLASS = max(class_counts.values())
+
+generated_records = []
+with torch.no_grad():
+    for class_name, class_idx in label_to_idx.items():
+        existing = class_counts.get(class_name, 0)
+        n_gen = max(0, TARGET_PER_CLASS - existing)
+        if n_gen == 0:
+            continue
+
+        all_gen = []
+        remaining = n_gen
+        while remaining > 0:
+            batch_n = min(remaining, BATCH_SIZE)
+            noise = torch.randn(batch_n, LATENT_DIM, 1, 1, device=device)
+            lbl   = torch.full((batch_n,), class_idx, dtype=torch.long, device=device)
+            gen   = netG(noise, lbl).cpu()
+            all_gen.append(gen)
+            remaining -= batch_n
+
+        gen_imgs = torch.cat(all_gen, dim=0)
+        gen_imgs = (gen_imgs * 0.5 + 0.5).clamp(0, 1)
+
+        for j, img_t in enumerate(gen_imgs):
+            fname = f"gan_{class_idx:03d}_{j:04d}.jpg"
+            tensor_to_pil(img_t).save(os.path.join(SAVE_DIR, fname))
+            generated_records.append({
+                "filename": fname,
+                "label": class_name,
+                "img_dir": SAVE_DIR,
+            })
+
+        print(f"  [{class_idx:02d}] {class_name}: generated {n_gen}")
+
+gen_df = pd.DataFrame(generated_records)
+gen_df.to_csv(os.path.join(SAVE_DIR, "generated.csv"), index=False)
+print(f"\nTotal generated: {len(gen_df):,}  |  CSV saved.")
 
 
 # %%

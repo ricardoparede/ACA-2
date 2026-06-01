@@ -1,11 +1,6 @@
 """
 dataset.py
-Butterfly dataset utilities shared across all notebooks.
-
-CSV format (train.csv):
-    filename   label
-    Image_0.jpg  CLOUDED SULPHUR
-    ...
+Core dataset abstractions and transformation pipelines for butterfly image processing.
 """
 
 import os
@@ -16,23 +11,13 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
-
-# ---------------------------------------------------------------------------
-# Label utilities
-# ---------------------------------------------------------------------------
-
 def build_label_map(csv_path: str) -> tuple[dict, dict]:
-    """Return (label_to_idx, idx_to_label) built from a CSV file."""
+    """Construct bidirectional mapping between label strings and integer indices from metadata CSV."""
     df = pd.read_csv(csv_path)
     classes = sorted(df["label"].unique().tolist())
     label_to_idx = {c: i for i, c in enumerate(classes)}
     idx_to_label = {i: c for c, i in label_to_idx.items()}
     return label_to_idx, idx_to_label
-
-
-# ---------------------------------------------------------------------------
-# Train / Val / Test split
-# ---------------------------------------------------------------------------
 
 def get_splits(
     csv_path: str,
@@ -41,8 +26,16 @@ def get_splits(
     seed: int = 42,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Stratified split by label.  Returns (train_df, val_df, test_df).
-    test_ratio is inferred as 1 - train_ratio - val_ratio.
+    Perform stratified dataset partitioning based on class labels.
+    
+    Args:
+        csv_path: Path to the training metadata CSV.
+        train_ratio: Proportion of data for training.
+        val_ratio: Proportion of data for validation.
+        seed: Random seed for reproducibility.
+        
+    Returns:
+        (train_df, val_df, test_df) stratified by label.
     """
     rng = np.random.default_rng(seed)
     df = pd.read_csv(csv_path)
@@ -62,20 +55,15 @@ def get_splits(
     test_df = pd.concat(test_rows).reset_index(drop=True)
     return train_df, val_df, test_df
 
-
-# ---------------------------------------------------------------------------
-# ButterflyDataset  (mirrors the one in TP2-students.ipynb)
-# ---------------------------------------------------------------------------
-
 class ButterflyDataset(Dataset):
     """
-    Loads butterfly images from a flat directory using a DataFrame slice.
+    Map-style dataset for loading butterfly images from a single directory using a DataFrame slice.
 
-    Args:
-        df          : DataFrame with columns ['filename', 'label']
-        img_dir     : Directory that contains the image files
-        label_to_idx: Mapping from species string to integer class index
-        transform   : torchvision transform to apply to each image
+    Attributes:
+        df: DataFrame containing ['filename', 'label'] columns.
+        img_dir: Root directory for image assets.
+        label_to_idx: Label-to-index mapping.
+        transform: Image transformation pipeline.
     """
 
     def __init__(
@@ -102,18 +90,11 @@ class ButterflyDataset(Dataset):
             image = self.transform(image)
         return image, label
 
-
-# ---------------------------------------------------------------------------
-# AugmentedButterflyDataset
-# ---------------------------------------------------------------------------
-
 class AugmentedButterflyDataset(Dataset):
     """
-    Identical interface to ButterflyDataset but accepts a combined DataFrame
-    that may reference images from multiple directories.
+    Dataset variant for handling mixed-source data with per-row directory paths.
 
-    The DataFrame must have columns ['filename', 'label', 'img_dir'] where
-    'img_dir' is the absolute directory for that row's image.
+    Expects DataFrame columns: ['filename', 'label', 'img_dir'].
     """
 
     def __init__(
@@ -138,12 +119,8 @@ class AugmentedButterflyDataset(Dataset):
             image = self.transform(image)
         return image, label
 
-
-# ---------------------------------------------------------------------------
-# Standard transforms (reusable across notebooks)
-# ---------------------------------------------------------------------------
-
 def get_train_transform(image_size: int = 64) -> transforms.Compose:
+    """Define standard augmentation pipeline for training."""
     return transforms.Compose([
         transforms.Resize((image_size, image_size)),
         transforms.RandomHorizontalFlip(),
@@ -152,26 +129,20 @@ def get_train_transform(image_size: int = 64) -> transforms.Compose:
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ])
 
-
 def get_eval_transform(image_size: int = 64) -> transforms.Compose:
+    """Standard normalization pipeline for evaluation."""
     return transforms.Compose([
         transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ])
 
-
 def get_baseline_transform(image_size: int = 64) -> transforms.Compose:
-    """Matches the exact transform in TP2-students.ipynb (no augmentation)."""
+    """Minimal transformation pipeline matching the original project baseline."""
     return transforms.Compose([
         transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
     ])
-
-
-# ---------------------------------------------------------------------------
-# DataLoader factory
-# ---------------------------------------------------------------------------
 
 def make_dataloader(
     dataset: Dataset,
@@ -179,6 +150,7 @@ def make_dataloader(
     shuffle: bool = True,
     num_workers: int = 0,
 ) -> DataLoader:
+    """Initialize DataLoader with optimal memory pinning for CUDA execution."""
     return DataLoader(
         dataset,
         batch_size=batch_size,
